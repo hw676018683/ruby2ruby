@@ -34,7 +34,7 @@ class Ruby2Ruby < SexpProcessor
   VERSION = "2.4.4" # :nodoc:
 
   # cutoff for one-liners
-  LINE_LENGTH = 78
+  LINE_LENGTH = 150
 
   # binary operation messages
   BINARY = [:<=>, :==, :<, :>, :<=, :>=, :-, :+, :*, :/, :%, :<<, :>>, :**, :"!=", :^, :|, :&]
@@ -103,7 +103,7 @@ class Ruby2Ruby < SexpProcessor
   def process_and exp # :nodoc:
     _, lhs, rhs = exp
 
-    parenthesize "#{process lhs} and #{process rhs}"
+    parenthesize "#{process lhs} && #{process rhs}"
   end
 
   def process_arglist exp # custom made node # :nodoc:
@@ -208,6 +208,12 @@ class Ruby2Ruby < SexpProcessor
     }
 
     result << "# do nothing\n" if result.empty?
+
+    # FIX: incompatible character encodings: UTF-8 and ASCII-8BIT
+    result.map do |item|
+      item.encoding.to_s != "UTF-8" ? item.force_encoding('utf-8') : item
+    end
+
     result = parenthesize result.join "\n"
     result += "\n" unless result.start_with? "("
 
@@ -287,18 +293,27 @@ class Ruby2Ruby < SexpProcessor
       rhs = args.pop
       "#{receiver}[#{args.join(", ")}] = #{rhs}"
     when :"!" then
-      "(not #{receiver})"
+      "!#{receiver}"
     when :"-@" then
       "-#{receiver}"
     when :"+@" then
       "+#{receiver}"
     else
       args     = nil                    if args.empty?
-      args     = "(#{args.join(", ")})" if args
+      if args
+        if %w(to to_not it require describe include).include?(name.to_s) || (%w(get post put patch delete).include?(name.to_s) && receiver == nil)
+          args = " #{args.join(", ")}"
+        else
+          args = "(#{args.join(", ")})"
+        end
+      end
+
       receiver = "#{receiver}."         if receiver and not safe_call
       receiver = "#{receiver}&."        if receiver and safe_call
 
-      "#{receiver}#{name}#{args}"
+      result = "#{receiver}#{name}#{args}"
+      # result << "\n" if name == :require
+      result
     end
   ensure
     @calls.pop
@@ -468,6 +483,24 @@ class Ruby2Ruby < SexpProcessor
 
   def process_dstr(exp) # :nodoc:
     "\"#{util_dthing(:dstr, exp)}\""
+    # s = util_dthing(:dstr, exp)
+    # if /"/ =~ s
+    #   if /{/ !~ s
+    #     "%{#{s}}"
+    #   elsif /\[/ !~ s
+    #     "%[#{s}]"
+    #   elsif /\(/ !~ s
+    #     "%(#{s})"
+    #   else
+    #     <<-DOCS
+    #       <<-EOS
+    #         #{s}
+    #       EOS
+    #     DOCS
+    #   end
+    # else
+    #   %{"#{s}"}
+    # end
   end
 
   def process_dsym(exp) # :nodoc:
@@ -549,13 +582,14 @@ class Ruby2Ruby < SexpProcessor
 
         lhs = process k
         rhs = process v
-        rhs = "(#{rhs})" unless HASH_VAL_NO_PAREN.include? t
+        # rhs = "(#{rhs})" unless HASH_VAL_NO_PAREN.include? t
 
         "%s => %s" % [lhs, rhs]
       end
     }
 
-    result.empty? ? "{}" : "{ #{result.join(", ")} }"
+    result = result.empty? ? "{}" : "{ #{result.join(", ")} }"
+    result.gsub(/:(\w+)\s*=>/, "\\1:")
   end
 
   def process_iasgn(exp) # :nodoc:
@@ -610,8 +644,15 @@ class Ruby2Ruby < SexpProcessor
     "->"
   end
 
+  # it方法调用专门做了去括号处理，如果这时候block只有一行，会生成`it 'description' { code }`
+  # 这样的代码语法错误，改成让其生成为
+  # it 'description' do
+  #   code
+  # end
   def process_iter(exp) # :nodoc:
     _, iter, args, body = exp
+
+    not_one_line_block = iter.sexp_type == :call && %i(it expect).include?(iter.sexp_body.values&.sexp_type)
 
     is_lambda = iter.sexp_type == :lambda
 
@@ -652,7 +693,7 @@ class Ruby2Ruby < SexpProcessor
               end
     result << "}"
     result = result.join
-    return result if result !~ /\n/ and result.size < LINE_LENGTH
+    return result if result !~ /\n/ and result.size < LINE_LENGTH and !not_one_line_block
 
     result = []
 
@@ -671,6 +712,7 @@ class Ruby2Ruby < SexpProcessor
       result << "\n"
     end
     result << e
+    result << "\n" unless %w(expect).include?(iter) || iter =~ /\.find$/
     result.join
   end
 
@@ -718,8 +760,11 @@ class Ruby2Ruby < SexpProcessor
         if sexp.sexp_type == :array then
           parenthesize = context.grep(:masgn).size > 1
           res = process sexp
-
-          res[1..-2]
+          if sexp.size < 3
+            res[1..-2] + ","
+          else
+            res[1..-2]
+          end
         else
           process sexp
         end
@@ -783,7 +828,7 @@ class Ruby2Ruby < SexpProcessor
 
   def process_not(exp) # :nodoc:
     _, sexp = exp
-    "(not #{process sexp})"
+    "!#{process sexp}"
   end
 
   def process_nth_ref(exp) # :nodoc:
@@ -981,7 +1026,20 @@ class Ruby2Ruby < SexpProcessor
 
   def process_str(exp) # :nodoc:
     _, s = exp
-    s.dump
+    s = s.dup.force_encoding('UTF-8')
+    if s.valid_encoding?
+      new_string_dump(s)
+    else
+      s.dump
+    end
+  end
+
+  def new_string_dump(s)
+    result = s.gsub(/[^\p{Han}《》。，！（）「」－【】“”]+/u) do |matched|
+      matched.dump[1..-2]
+    end
+
+    "\"#{result}\""
   end
 
   def process_super(exp) # :nodoc:
@@ -1205,7 +1263,7 @@ class Ruby2Ruby < SexpProcessor
     when :dregx then
       lit.gsub(/(\A|[^\\])\//, '\1\/')
     when :dstr, :dsym then
-      lit.dump[1..-2]
+      lit.is_a?(String) ? new_string_dump(lit)[1..-2] : lit.dump[1..-2]
     when :dxstr then
       lit.gsub(/`/, '\`')
     else
